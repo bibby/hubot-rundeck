@@ -7,31 +7,26 @@
 #   "xml2js": "^0.4.1"
 #
 # Commands:
-#   hubot rundeck projects [alias]                                   - Gets a list of the projects for the given server alias
-#   hubut rundeck jobs '[project]' [alias]                           - Gets a list of all the jobs in the given project for the given server alias
-#   hubot rundeck trigger '[job]' '[project]' [alias] [args]         - Triggers the given job for the given project
-#   hubot rundeck status '[job]' '[project]' [alias]                 - Shows the current status for the latest execution of the given job
-#   hubot rundeck show aliases                                       - shows the aliases for the list of rundeck instances
-#   hubot rundeck add alias [alias name] [url] [authToken]           - sets the alias for a given url and authentication token
-#   hubot rundeck clear alias [alias name]                           - removed the given alias
-#
-#rundeck show status of (.*) (?:in|for) (.*) (?:in|for) (.*)
-# Notes:
-#   The server must be a fqdn (with the port!) to get to rundeck
+#   hubot rundeck projects                        - Gets a list of the projects for the given server alias
+#   hubut rundeck jobs [project]                  - Gets a list of all the jobs in the given project for the given server alias
+#   hubot rundeck trigger [project] [job] [args]  - Triggers the given job for the given project
+#   hubot rundeck status [project] [job]          - Shows the current status for the latest execution of the given job
 #
 # Author:
 #  Liam Bennett
+#  bibby (modified)
 
 _ = require('underscore')
 sys = require 'sys' # Used for debugging
 Parser = require('xml2js').Parser
-_rundeckAliases = {}
 
 class Rundeck
-  constructor: (@robot, @url, @authToken) ->
+  constructor: (@robot) ->
     @logger = @robot.logger
 
-    @baseUrl = "#{@url}/api/12"
+    @baseUrl = "#{process.env.HUBOT_RUNDECK_URL}/api/12"
+    @authToken = process.env.HUBOT_RUNDECK_TOKEN
+    @adminRole = "rundeck_admin"
 
     @headers =
       "Accept": "application/xml"
@@ -65,6 +60,12 @@ class Rundeck
       else
         parser.parseString body, (e, json) ->
           cb json
+
+  challenge: (msg) ->
+    if @robot.auth.hasRole(msg.envelope.user, @adminRole)
+      return true
+    msg.send(msg.envelope.user.name + " not authorized.")
+    return false
 
 class Projects
   constructor: (@rundeck) ->
@@ -136,7 +137,7 @@ class Executions
   list: (cb) ->
     executions = []
     @rundeck.get "job/#{@job.id}/executions", (results) ->
-      for execution in results.result.executions[0].execution
+      for execution in results.executions.execution
         exec = new Execution(execution)
         executions.push exec
 
@@ -153,142 +154,67 @@ class Execution
 
 module.exports = (robot) ->
   logger = robot.logger
+  rundeck = new Rundeck(robot)
 
-  robot.brain.on 'loaded', ->
-    if robot.brain.data.rundeck_aliases?
-      _rundeckAliases = robot.brain.data.rundeck_aliases
-
-  showAliases = (msg) ->
-    if _rundeckAliases == null || Object.keys(_rundeckAliases).length == 0
-      msg.send("I cannot find any rundeck system aliases")
-    else
-      for alias of _rundeckAliases
-        msg.send("I found '#{alias}' as an alias for the system: #{_rundeckAliases[alias]['url']} - #{_rundeckAliases[alias]['authToken']}")
-
-  clearAlias = (msg, alias) ->
-    delete _rundeckAliases[alias]
-    robot.brain.data.rundeck_aliases = _rundeckAliases
-    msg.send("The rundeck system alias #{alias} has been removed")
-
-  setAlias = (msg, alias, url, token) ->
-    _rundeckAliases[alias] = { url: url, authToken: token }
-    robot.brain.data.rundeck_aliases = _rundeckAliases
-    msg.send("The rundeck system alias #{alias} for #{url} has been added to the brain")
-
-  #hubot rundeck projects myrundeck-alias
-  robot.respond /rundeck projects (.*)/i, (msg) ->
-    if msg.message.user.id is robot.name
+  robot.respond /rundeck projects/i, (msg) ->
+    if not rundeck.challenge msg
       return
 
-    alias =  msg.match[1]
-    url = _rundeckAliases[alias]['url']
-    token = _rundeckAliases[alias]['authToken']
+    rundeck.projects().list (projects) ->
+      if projects.length > 0
+        for project in projects
+          msg.send project.formatList()
+      else
+        msg.send "No rundeck projects found."
 
-
-    if url == null || url == undefined || token == null || token == undefined
-      msg.send "Do not recognise rundeck system alias #{alias}"
-    else
-      rundeck = new Rundeck(robot, url, token)
-      rundeck.projects().list (projects) ->
-        if projects.length > 0
-          for project in projects
-            msg.send project.formatList()
-        else
-          msg.send "No rundeck projects found."
-
-  #hubot rundeck 'MyProject' jobs myrundeck-alias
-  robot.respond /rundeck '(.*)' jobs (.*)/i, (msg) ->
-    if msg.message.user.id is robot.name
+  #hubot rundeck MyProject jobs
+  robot.respond /rundeck jobs (\w+)/i, (msg) ->
+    if not rundeck.challenge msg
       return
 
     project = msg.match[1]
 
-    alias =  msg.match[2]
-    url = _rundeckAliases[alias]['url']
-    token = _rundeckAliases[alias]['authToken']
+    rundeck.jobs(project).list (jobs) ->
+      if jobs.length > 0
+        for job in jobs
+          msg.send job.formatList()
+      else
+        msg.send "No jobs found for rundeck #{project}"
 
-    if url == null || url == undefined || token == null || token == undefined
-      msg.send "Do not recognise rundeck system alias #{alias}"
-    else
-      rundeck = new Rundeck(robot, url, token)
-      rundeck.jobs(project).list (jobs) ->
-        if jobs.length > 0
-          for job in jobs
-            msg.send job.formatList()
-        else
-          msg.send "No jobs found for rundeck #{project}"
-
-  #hubot rundeck trigger 'my-job' 'MyProject' myrundeck-alias args:<optional args>
-  robot.respond /rundeck trigger '(.*)'\s'(.*)'\s([\w]+)(?: args:)?(.*)/i, (msg) ->
-    if msg.message.user.id is robot.name
+  #hubot rundeck trigger MyProject my-job <optional args>
+  robot.respond /rundeck trigger (\w+) (\w+)\s?(.*)/i, (msg) ->
+    if not rundeck.challenge msg
       return
 
-    name = msg.match[1]
-    project = msg.match[2]
-    args = msg.match[4]
+    project = msg.match[1]
+    name = msg.match[2]
+    args = msg.match[3]
 
-    alias =  msg.match[3]
-    url = _rundeckAliases[alias]['url']
-    token = _rundeckAliases[alias]['authToken']
+    rundeck.jobs(project).run name, args, (job, results) ->
+      if job
+        msg.send "Successfully triggered a run for the job: #{name}"
+      else
+        msg.send "Could not execute rundeck job \"#{name}\"."
 
-    if url == null || url == undefined || token == null || token == undefined
-      msg.send "Do not recognise rundeck system alias #{alias}"
-    else
-      rundeck = new Rundeck(robot, url, token)
-      rundeck.jobs(project).run name, args, (job, results) ->
-        if job
-          msg.send "Successfully triggered a run for the job: #{name}"
-        else
-          msg.send "Could not execute rundeck job \"#{name}\"."
-
-  robot.respond /rundeck status '(.*)' '(.*)' '(.*)'/i, (msg) ->
-    if msg.message.user.id is robot.name
+  robot.respond /rundeck status (\w+) (\w+)/i, (msg) ->
+    if not rundeck.challenge msg
       return
 
-    name = msg.match[1]
-    project = msg.match[2]
+    project = msg.match[1]
+    name = msg.match[2]
 
-    alias =  msg.match[3]
-    url = _rundeckAliases[alias]['url']
-    token = _rundeckAliases[alias]['authToken']
-
-    if url == null || url == undefined || token == null || token == undefined
-      msg.send "Do not recognise rundeck system alias #{alias}"
-    else
-      rundeck = new Rundeck(robot, url, token)
-      rundeck.jobs(project).find name, (job) ->
-        if job
-          rundeck.executions(job).list (executions) ->
-            if executions.length > 0
-              keys = []
-              for item in executions
-                keys.push item.id
-              key = keys.sort()[keys.length - 1]
-              for execution in executions
-                if execution.id == key
-                  msg.send execution.formatList()
-            else
-              msg.send "No executions found"
-        else
-          msg.send "Could not find rundeck job \"#{name}\"."
-
-  robot.respond /rundeck show aliases/i, (msg) ->
-    if msg.message.user.id is robot.name
-      return
-
-    showAliases msg, (text) ->
-      msg.send(text)
-
-  robot.respond /rundeck add alias (.*) (.*) (.*)/i, (msg) ->
-    if msg.message.user.id is robot.name
-      return
-
-    setAlias msg, msg.match[1], msg.match[2], msg.match[3], (text) ->
-      msg.send(text)
-
-  robot.respond /rundeck clear alias (.*)/i, (msg) ->
-    if msg.message.user.id is robot.name
-      return
-
-    clearAlias msg, msg.match[1], (text) ->
-      msg.send(text)
+    rundeck.jobs(project).find name, (job) ->
+      if job
+        rundeck.executions(job).list (executions) ->
+          if executions.length > 0
+            keys = []
+            for item in executions
+              keys.push item.id
+            key = keys.sort()[keys.length - 1]
+            for execution in executions
+              if execution.id == key
+                msg.send execution.formatList()
+          else
+            msg.send "No executions found"
+      else
+        msg.send "Could not find rundeck job \"#{name}\"."
